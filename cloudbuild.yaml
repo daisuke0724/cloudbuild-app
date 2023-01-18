@@ -1,0 +1,103 @@
+steps:
+
+  - id: Build PHP Docker image
+    name: 'gcr.io/cloud-builders/docker'
+    args: [ 'build', '-t', 'gcr.io/example/php:$SHORT_SHA', '-f', 'docker/php/Dockerfile', '.' ]
+
+  - id: Build nginx Docker image
+    name: 'gcr.io/cloud-builders/docker'
+    args: [ 'build', '-t', 'gcr.io/example/nginx:$SHORT_SHA', '-f', 'docker/nginx/Dockerfile', '.' ]
+
+  - id: Push PHP Docker image to Container Registry
+    name: 'gcr.io/cloud-builders/docker'
+    args: [ 'push', 'gcr.io/example/php:$SHORT_SHA' ]
+
+  - id: Push nginx Docker image to Container Registry]
+    name: 'gcr.io/cloud-builders/docker'
+    args: [ 'push', 'gcr.io/example/nginx:$SHORT_SHA' ]
+
+  - id: access the id_github file from secret manager
+    name: 'gcr.io/cloud-builders/gcloud'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        gcloud secrets versions access latest --secret=secret-name > /root/.ssh/id_github
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+
+  - id: set up git with key and domain
+    name: 'gcr.io/cloud-builders/git'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        chmod 600 /root/.ssh/id_github
+        cat <<EOF >/root/.ssh/config
+        Hostname github.com
+        IdentityFile /root/.ssh/id_github
+        EOF
+        ssh-keyscan -t rsa github.com > /root/.ssh/known_hosts
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+
+  - id: Clone Github repository
+    name: 'gcr.io/cloud-builders/git'
+    args:
+      - clone
+      - --recurse-submodules
+      - git@github.com:daisuke0724/cloudbuild-env
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+
+  - id: Switch to candidate branch
+    name: 'gcr.io/cloud-builders/gcloud'
+    dir: cloudbuild-env
+    entrypoint: /bin/sh
+    args:
+      - '-c'
+      - |
+        set -x && \
+        git config --global user.email $(git log --format='%an <%ae>' -n 1 HEAD | sed 's/.*\<\([^>]*\)\>.*/\1/g') && \
+        git fetch origin candidate && \
+        git switch candidate && \
+        git fetch origin master && \
+        git merge origin/master
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
+
+  - id: Generate manifest for cloudbuild-env
+    name: 'gcr.io/cloud-builders/gcloud'
+    dir: cloudbuild-env
+    entrypoint: /bin/sh
+    args:
+      - '-c'
+      - |
+        set -x && \
+        sed "s/PROJECT_ID/${PROJECT_ID}/g" kubernetes.yaml.tpl | \
+        sed "s/SHORT_SHA/${SHORT_SHA}/g" > kubernetes.yaml
+
+  - id: Push generated manifests to candidate branch
+    name: 'gcr.io/cloud-builders/gcloud'
+    dir: cloudbuild-env
+    entrypoint: /bin/sh
+    args:
+      - '-c'
+      - |
+        set -x && \
+        git add kubernetes.yaml && \
+        git commit \
+        --author="Cloud Build Service Account <$(gcloud auth list --filter=status:ACTIVE --format='value(account)')>" \
+        -m "Deploying images
+        - gcr.io/${PROJECT_ID}/cloudbuild-app:${SHORT_SHA}
+        - gcr.io/${PROJECT_ID}/cloudbuild-env:${SHORT_SHA}
+        Built from commit ${COMMIT_SHA} of repository cloudbuild-app
+        Author: $(git log --format='%an <%ae>' -n 1 HEAD)" && \
+        git push origin candidate
+    volumes:
+      - name: 'ssh'
+        path: /root/.ssh
